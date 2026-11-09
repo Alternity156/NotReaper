@@ -656,6 +656,63 @@ namespace NotReaper.Tools {
         }
     }
 
+	/// <summary>
+	/// Moves existing targets onto a pathbuilder path (keeping their timing).
+	/// If makeChain is set, every target after the first becomes a chain node of the first target's hand.
+	/// </summary>
+	public class NRActionRepositionTargets : NRAction
+    {
+		private List<TargetData> targets;
+		private List<Vector2> oldPositions;
+		private List<Vector2> newPositions;
+		private bool makeChain;
+
+		private List<TargetBehavior> oldBehaviors;
+		private List<InternalTargetVelocity> oldVelocities;
+		private List<TargetHandType> oldHands;
+
+		public NRActionRepositionTargets(List<TargetData> targets, List<Vector2> oldPositions, List<Vector2> newPositions, bool makeChain)
+        {
+			this.targets = new List<TargetData>(targets);
+			this.oldPositions = new List<Vector2>(oldPositions);
+			this.newPositions = new List<Vector2>(newPositions);
+			this.makeChain = makeChain;
+			oldBehaviors = targets.Select(t => t.behavior).ToList();
+			oldVelocities = targets.Select(t => t.velocity).ToList();
+			oldHands = targets.Select(t => t.handType).ToList();
+        }
+
+		public override void DoAction(Timeline timeline)
+        {
+			for (int i = 0; i < targets.Count; i++)
+            {
+				targets[i].position = newPositions[i];
+				if (makeChain && i > 0)
+                {
+					targets[i].behavior = TargetBehavior.ChainNode;
+					targets[i].velocity = InternalTargetVelocity.Chain;
+					targets[i].handType = oldHands[0];
+                }
+            }
+			TransformTool.instance.UpdateOverlay();
+        }
+
+		public override void UndoAction(Timeline timeline)
+        {
+			for (int i = 0; i < targets.Count; i++)
+            {
+				targets[i].position = oldPositions[i];
+				if (makeChain && i > 0)
+                {
+					targets[i].behavior = oldBehaviors[i];
+					targets[i].velocity = oldVelocities[i];
+					targets[i].handType = oldHands[i];
+                }
+            }
+			TransformTool.instance.UpdateOverlay();
+        }
+    }
+
 	public class NRActionUpdatePathbuilderTarget : NRAction
     {
 		private TargetData targetData;

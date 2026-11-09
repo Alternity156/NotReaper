@@ -1,5 +1,6 @@
 ﻿using NotReaper.Grid;
 using NotReaper.Models;
+using NotReaper.Notifications;
 using NotReaper.Targets;
 using NotReaper.Timing;
 using NotReaper.Tools.ChainBuilder;
@@ -46,6 +47,17 @@ namespace NotReaper.Tools.PathBuilder
 		private bool isSegmentScope = true;
 		private PathbuilderData.Interval intervalOverride = new PathbuilderData.Interval(1, 16);
 		private QNT_Duration beatLengthOverride = new QNT_Duration(480);
+        #endregion
+
+        #region Reposition Mode
+		/// <summary>
+		/// True when the pathbuilder was opened with several existing targets selected.
+		/// Instead of generating new nodes, the path moves the selected targets along it,
+		/// keeping their timing. activeTarget is the earliest selected target (the path start).
+		/// </summary>
+		private bool repositionMode = false;
+		private List<TargetData> repositionTargets = new List<TargetData>();
+		private List<Vector2> repositionStartPositions = new List<Vector2>();
         #endregion
 
         #region State
@@ -130,9 +142,14 @@ namespace NotReaper.Tools.PathBuilder
 						LoadTargetData(timeline.selectedNotes[0]);
                     }
                 }
+				else if (timeline.selectedNotes.Count > 1)
+                {
+					TryStartReposition(timeline.selectedNotes);
+                }
             }
 			else
             {
+				if (repositionMode) FinishReposition();
 				EditorState.SelectSnappingMode(EditorState.Snapping.Previous);
 				HideUI();
 				ClearData();
@@ -158,6 +175,7 @@ namespace NotReaper.Tools.PathBuilder
 
         internal void OnDenominatorChanged(int denominator)
         {
+			if (repositionMode) return;
             if (isSegmentScope)
             {
 				activeSegment.SetDenominator(denominator);
@@ -171,6 +189,7 @@ namespace NotReaper.Tools.PathBuilder
 
         internal void ChangeAlternateHands()
         {
+			if (repositionMode) return;
 			alternateHands = !alternateHands;
 			activeTarget.data.pathbuilderData.AlternateHands = alternateHands;
 			UpdateActivePathbuilderTarget(activeTarget);
@@ -179,6 +198,12 @@ namespace NotReaper.Tools.PathBuilder
 		public void BakeActiveTarget()
         {
 			if (activeTarget == null) return;
+			if (repositionMode)
+            {
+				// "Bake" in reposition mode = apply the new positions and leave the tool.
+				Activate(false);
+				return;
+            }
 			NRActionBakePathbuilderTarget action = new NRActionBakePathbuilderTarget(activeTarget.data, this);
 			timeline.Tools.undoRedoManager.AddAction(action);
         }
@@ -199,6 +224,7 @@ namespace NotReaper.Tools.PathBuilder
 
         internal void ChangeScope()
         {
+			if (repositionMode) return;
 			isSegmentScope = !isSegmentScope;
 			activeTarget.data.pathbuilderData.IsSegmentScope = isSegmentScope;
 			UpdateActivePathbuilderTarget(activeTarget);
@@ -223,12 +249,26 @@ namespace NotReaper.Tools.PathBuilder
 			activeTarget.data.position = pos;
         }
 
+		private void LateUpdate()
+        {
+			if (!repositionMode) return;
+			if (activeTarget == null || activeTarget.gridTargetIcon == null)
+            {
+				// Root target got deleted or unloaded while editing; bail out safely.
+				CancelReposition();
+				return;
+            }
+			ApplyRepositionPreview();
+        }
+
         private void OnMouseClickEnd()
         {
 			isMouseDown = false;
 			if (!dragNote) return;
 			dragNote = false;
 			if (activeSegment != null) activeSegment.OnHandleDragStop();
+			// In reposition mode the root's move is recorded by the single commit action.
+			if (repositionMode) return;
 			TargetGridMoveIntent intent = new TargetGridMoveIntent();
 			intent.target = activeTarget.data;
 			intent.startingPosition = dragStartPos;
@@ -324,6 +364,7 @@ namespace NotReaper.Tools.PathBuilder
 
         internal void OnNominatorChanged(int nominator)
         {
+			if (repositionMode) return;
             if (isSegmentScope)
             {
 				activeSegment.SetNominator(nominator);
@@ -337,6 +378,7 @@ namespace NotReaper.Tools.PathBuilder
 
 		internal void OnBeatlengthChanged(bool increase)
         {
+			if (repositionMode) return;
 			QNT_Duration increment = Constants.DurationFromBeatSnap((uint)timeline.beatSnap);
 			QNT_Duration targetLength = isSegmentScope ? activeSegment.beatLength : beatLengthOverride;
 			if (increase)
@@ -391,6 +433,14 @@ namespace NotReaper.Tools.PathBuilder
 
 		public void SaveTargetState()
         {
+            if (repositionMode)
+            {
+				// No per-step undo in reposition mode: positions are previewed live in LateUpdate
+				// and committed as one undoable action when the tool closes.
+				// If every segment was removed, start a fresh one from the root again.
+				if (segments.Count == 0 && tempSegment == null) StartRepositionTempSegment();
+				return;
+            }
 			NRActionUpdatePathbuilderTarget segmentAction = new NRActionUpdatePathbuilderTarget(activeTarget.data, this, GetPathbuilderData());
 			Timeline.instance.Tools.undoRedoManager.AddAction(segmentAction);
 		}
@@ -486,7 +536,7 @@ namespace NotReaper.Tools.PathBuilder
 			foreach (var s in segments) s.SetSelected(false);
 			segment.SetSelected(true);
 			activeSegment = segment;
-			UpdateSegmentIndicator(activeTarget, true);
+			if (!repositionMode) UpdateSegmentIndicator(activeTarget, true);
 			UpdateUI();
         }
 		/// <summary>
@@ -496,6 +546,13 @@ namespace NotReaper.Tools.PathBuilder
 		/// <param name="enable">True if you want to enable the indicator.</param>
 		private void UpdateSegmentIndicator(Target target, bool enable)
         {
+			// The target's icons can be destroyed (deleted, difficulty switch, map reload) while it's still referenced here.
+			// Touching them throws, which used to abort ClearData() before activeTarget got reset.
+			if (target == null || target.timelineTargetIcon == null)
+            {
+				activeSegmentIndicator.enabled = false;
+				return;
+            }
             if (enable)
             {
 				float height = target.timelineTargetIcon.sustainDirection;
@@ -599,6 +656,7 @@ namespace NotReaper.Tools.PathBuilder
 		/// </summary>
 		private void Save()
         {
+			if (repositionMode) return;
 			if (activeTarget != null)
 			{
 				var data = GetPathbuilderData();
@@ -618,6 +676,194 @@ namespace NotReaper.Tools.PathBuilder
 			int index = (int)target.data.behavior;
 			return index < 5 && !target.transient && !target.data.isPathbuilderTarget;
         }
+
+		#region Reposition Mode
+		/// <summary>
+		/// Targets that may be moved onto a path: no melees/mines, no pathbuilder roots or generated nodes.
+		/// </summary>
+		private bool IsValidRepositionCandidate(Target target)
+        {
+			if (target == null || target.transient) return false;
+			var data = target.data;
+			if (data.isPathbuilderTarget) return false;
+			var b = data.behavior;
+			return b != TargetBehavior.Melee && b != TargetBehavior.Mine && b != TargetBehavior.Legacy_Pathbuilder && b != TargetBehavior.None;
+        }
+
+		/// <summary>
+		/// Enters reposition mode with the given selection. The earliest target becomes the path start;
+		/// only targets of the same hand as that start are moved.
+		/// </summary>
+		/// <returns>True if reposition mode was started.</returns>
+		private bool TryStartReposition(List<Target> selection)
+        {
+			var candidates = selection.Where(IsValidRepositionCandidate).OrderBy(t => t.data.time.tick).ToList();
+			if (candidates.Count < 2)
+            {
+				NotificationCenter.SendNotification("Pathbuilder: select at least 2 regular targets (no melees/mines/pathbuilder targets) to build a path through them.", NotificationType.Warning);
+				return false;
+            }
+
+			Target root = candidates[0];
+			if (root.gridTargetIcon == null) return false;
+			TargetHandType hand = root.data.handType;
+			var targets = candidates.Where(t => t.data.handType == hand).ToList();
+			if (targets.Count < 2)
+            {
+				NotificationCenter.SendNotification("Pathbuilder: need at least 2 selected targets of the same hand as the earliest one.", NotificationType.Warning);
+				return false;
+            }
+			if (targets.Last().data.time.tick == root.data.time.tick)
+            {
+				NotificationCenter.SendNotification("Pathbuilder: selected targets need different times to build a path.", NotificationType.Warning);
+				return false;
+            }
+
+			ClearData();
+			repositionMode = true;
+			activeTarget = root;
+			repositionTargets = targets.Select(t => t.data).ToList();
+			repositionStartPositions = repositionTargets.Select(d => d.position).ToList();
+
+			// Keep the window open (Bake applies the path). Interval / beat length controls are no-ops here:
+			// timing comes from the targets themselves.
+			SetPathLayerOnTop(true);
+			StartRepositionTempSegment();
+			UpdateUI();
+
+			int skipped = selection.Count - targets.Count;
+			string kind = root.data.behavior == TargetBehavior.ChainStart ? "chain" : "path";
+			string message = $"Pathbuilder: drawing a {kind} through {targets.Count} selected targets. Click to place the end point, drag the handles to curve it, then Bake or Esc to apply.";
+			if (skipped > 0) message += $" {skipped} target(s) of the other hand or an unsupported type were left alone.";
+			NotificationCenter.SendNotification(message, NotificationType.Info);
+			return true;
+        }
+
+		/// <summary>
+		/// Starts a segment from the current path end (or the root) that follows the mouse until clicked.
+		/// </summary>
+		private void StartRepositionTempSegment()
+        {
+			if (activeTarget == null) return;
+			var segment = segmentPool.Spawn(pathbuilderParent);
+			segment.Initialize(this, actions);
+			Transform start = segments.Count > 0 ? segments.Last().GetSegmentEndPoint() : activeTarget.gridTargetIcon.transform;
+			segment.StartNewSegment(actions, start, activeTarget, this, segments.Count);
+			segment.SetInterval(new PathbuilderData.Interval());
+			segment.SetBeatlength(Constants.QuarterNoteDuration);
+			tempSegment = segment;
+        }
+
+		/// <summary>
+		/// Collects the current path as cubic bezier control points (start, startHandle, endHandle, end).
+		/// A segment still following the mouse is treated as a straight line.
+		/// </summary>
+		private List<Vector2[]> GetRepositionCurves()
+        {
+			var curves = new List<Vector2[]>();
+			foreach (var segment in segments)
+            {
+				var d = segment.GetSegmentData();
+				curves.Add(new Vector2[] { d.startPoint, d.startPointHandle, d.endPointHandle, d.endPoint });
+            }
+			if (tempSegment != null)
+            {
+				var d = tempSegment.GetSegmentData();
+				curves.Add(new Vector2[] { d.startPoint, Vector2.Lerp(d.startPoint, d.endPoint, .25f), Vector2.Lerp(d.startPoint, d.endPoint, .75f), d.endPoint });
+            }
+			return curves;
+        }
+
+		/// <summary>
+		/// Moves the selected targets onto the current path. Called every frame while in reposition mode.
+		/// </summary>
+		private void ApplyRepositionPreview()
+        {
+			var curves = GetRepositionCurves();
+			if (curves.Count == 0)
+            {
+				RestoreRepositionPositions(true);
+				return;
+            }
+			var ticks = repositionTargets.Select(d => d.time.tick).ToList();
+			var positions = PathPlacement.PlaceByTime(curves, ticks);
+			// Index 0 is the root and defines the path start, so it's never moved by the path itself.
+			for (int i = 1; i < repositionTargets.Count; i++)
+            {
+				if (repositionTargets[i].position != positions[i]) repositionTargets[i].position = positions[i];
+            }
+        }
+
+		/// <summary>
+		/// Puts targets back where they were when reposition mode started.
+		/// </summary>
+		private void RestoreRepositionPositions(bool skipRoot)
+        {
+			for (int i = skipRoot ? 1 : 0; i < repositionTargets.Count; i++)
+            {
+				if (repositionTargets[i].position != repositionStartPositions[i]) repositionTargets[i].position = repositionStartPositions[i];
+            }
+        }
+
+		/// <summary>
+		/// Commits the reposition as one undoable action (or reverts if no segment was placed) and leaves reposition mode.
+		/// </summary>
+		private void FinishReposition()
+        {
+			if (!repositionMode) return;
+			bool hasPath = segments.Count > 0;
+			if (hasPath)
+            {
+				ApplyRepositionPreview();
+				var finalPositions = repositionTargets.Select(d => d.position).ToList();
+				RestoreRepositionPositions(false);
+				bool makeChain = repositionTargets[0].behavior == TargetBehavior.ChainStart;
+				var action = new NRActionRepositionTargets(repositionTargets, repositionStartPositions, finalPositions, makeChain);
+				timeline.Tools.undoRedoManager.AddAction(action);
+            }
+            else
+            {
+				RestoreRepositionPositions(false);
+            }
+			EndReposition();
+        }
+
+		private void CancelReposition()
+        {
+			if (!repositionMode) return;
+			RestoreRepositionPositions(false);
+			EndReposition();
+        }
+
+		/// <summary>
+		/// The path canvas sorts behind targets (order -3). In reposition mode the real targets sit right on the line
+		/// and cover the handles, so the path layer gets its own canvas sorted above them while editing.
+		/// </summary>
+		private void SetPathLayerOnTop(bool onTop)
+        {
+			var layer = pathbuilderParent.GetComponent<Canvas>();
+			if (layer == null)
+            {
+				if (!onTop) return;
+				layer = pathbuilderParent.gameObject.AddComponent<Canvas>();
+				// A nested canvas needs its own raycaster, otherwise the handles stop receiving clicks.
+				pathbuilderParent.gameObject.AddComponent<UnityEngine.UI.GraphicRaycaster>();
+            }
+			layer.overrideSorting = onTop;
+			layer.sortingOrder = onTop ? 100 : 0;
+        }
+
+		private void EndReposition()
+        {
+			SetPathLayerOnTop(false);
+			RemoveAllSegments();
+			activeTarget = null;
+			activePoint = null;
+			repositionMode = false;
+			repositionTargets = new List<TargetData>();
+			repositionStartPositions = new List<Vector2>();
+        }
+		#endregion
 
 		#region Input Callbacks
 		protected override void RegisterCallbacks()
@@ -643,6 +889,27 @@ namespace NotReaper.Tools.PathBuilder
 		{
 			iconsUnderMouse = null;
 			isMouseDown = true;
+
+            if (repositionMode)
+            {
+				// Clicking the root lets you drag the whole path's start point.
+				if (iconUnderMouse != null && iconUnderMouse.target == activeTarget && segments.Count > 0)
+                {
+					SetActiveSegment(segments[0]);
+					dragStartPos = GetMousePosition();
+					dragNote = true;
+					return;
+                }
+				// Other targets are ignored so a click never switches away from the selection.
+				if (tempSegment != null)
+                {
+					tempSegment.SetSegmentEndPoint();
+					segments.Add(tempSegment);
+					tempSegment = null;
+                }
+				return;
+            }
+
 			if (iconUnderMouse != null)
 			{
 				var target = iconUnderMouse.target;
@@ -734,7 +1001,7 @@ namespace NotReaper.Tools.PathBuilder
 
 		private void OnChangeInterval(bool increase)
         {
-			if (activeTarget == null || activeSegment == null) return;
+			if (activeTarget == null || activeSegment == null || repositionMode) return;
 			ui.OnIntervalChanged(increase);
         }
 
@@ -759,5 +1026,73 @@ namespace NotReaper.Tools.PathBuilder
         }
         #endregion
     }
-}
 
+	/// <summary>
+	/// Places targets along a chain of cubic bezier curves according to their time.
+	/// The first target sits at the path start, the last at the path end, and everything in between
+	/// is placed by arc length, so the path is travelled at constant speed and gaps in timing
+	/// (e.g. a missing 4th beat) show up as matching gaps in space.
+	/// </summary>
+	public static class PathPlacement
+    {
+		public const int SamplesPerCurve = 64;
+
+		public static Vector2 Cubic(Vector2 a, Vector2 b, Vector2 c, Vector2 d, float t)
+        {
+			float u = 1f - t;
+			return u * u * u * a + 3f * u * u * t * b + 3f * u * t * t * c + t * t * t * d;
+        }
+
+		/// <param name="curves">Each entry is {start, startHandle, endHandle, end}; curve i+1 starts where curve i ends.</param>
+		/// <param name="ticks">Target times, sorted ascending.</param>
+		/// <returns>One position per tick.</returns>
+		public static List<Vector2> PlaceByTime(List<Vector2[]> curves, IList<ulong> ticks, int samplesPerCurve = SamplesPerCurve)
+        {
+			var result = new List<Vector2>(ticks.Count);
+			if (ticks.Count == 0) return result;
+			if (curves == null || curves.Count == 0)
+            {
+				for (int i = 0; i < ticks.Count; i++) result.Add(Vector2.zero);
+				return result;
+            }
+
+			// Sample the whole path and build a cumulative arc length table.
+			var points = new List<Vector2>(curves.Count * samplesPerCurve + 1);
+			var lengths = new List<float>(curves.Count * samplesPerCurve + 1);
+			points.Add(curves[0][0]);
+			lengths.Add(0f);
+			foreach (var c in curves)
+            {
+				for (int s = 1; s <= samplesPerCurve; s++)
+                {
+					Vector2 p = Cubic(c[0], c[1], c[2], c[3], (float)s / samplesPerCurve);
+					lengths.Add(lengths[lengths.Count - 1] + Vector2.Distance(points[points.Count - 1], p));
+					points.Add(p);
+                }
+            }
+
+			float total = lengths[lengths.Count - 1];
+			ulong first = ticks[0];
+			ulong last = ticks[ticks.Count - 1];
+			double span = last > first ? (double)(last - first) : 0d;
+
+			int seg = 0;
+			for (int i = 0; i < ticks.Count; i++)
+            {
+				if (total <= Mathf.Epsilon || span <= 0d)
+                {
+					result.Add(points[0]);
+					continue;
+                }
+				float f = (float)((ticks[i] - first) / span);
+				float targetLength = Mathf.Clamp01(f) * total;
+				// ticks are sorted, so the sample index only ever moves forward.
+				while (seg < lengths.Count - 2 && lengths[seg + 1] < targetLength) seg++;
+				float segLength = lengths[seg + 1] - lengths[seg];
+				float t = segLength > Mathf.Epsilon ? (targetLength - lengths[seg]) / segLength : 0f;
+				result.Add(Vector2.Lerp(points[seg], points[seg + 1], t));
+            }
+			return result;
+        }
+    }
+}

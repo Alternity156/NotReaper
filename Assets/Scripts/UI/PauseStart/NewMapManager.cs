@@ -288,18 +288,22 @@ namespace NotReaper.UI
                     artistMeta = line;
                 }
             }
-            string normalized_db = max_volume.Split(' ')[4]; // Grab only the number
-
-            float foundVolume = float.Parse(normalized_db); // Crappy maths
-            if (foundVolume > 0)
+            // Line looks like: "[Parsed_volumedetect_0 @ 0x...] max_volume: -0.1 dB"
+            var match = System.Text.RegularExpressions.Regex.Match(max_volume, @"max_volume:\s*(-?[0-9]+(?:\.[0-9]+)?)");
+            float foundVolume;
+            if (match.Success && float.TryParse(match.Groups[1].Value,
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out foundVolume))
             {
-                foundVolume *= -1;
+                // Invert the peak so the song is normalized toward 0 dB
+                foundVolume = -foundVolume;
+                moggSongVolume = foundVolume - Mathf.Abs(moggSongVolume);
             }
-            else if (foundVolume < 0)
+            else
             {
-                foundVolume = Mathf.Abs(foundVolume);
+                UnityEngine.Debug.LogWarning($"Auto volume: could not read max_volume from ffmpeg output: '{max_volume}'");
             }
-            moggSongVolume = foundVolume - Mathf.Abs(moggSongVolume);
 
             if (!String.IsNullOrEmpty(songNameMeta))
             {

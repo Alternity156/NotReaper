@@ -54,5 +54,6 @@
         "Notif",
         "UGUI",
         "audica"
-    ]
+    ],
+    "dotnet.preferCSharpExtension": true
 }
